@@ -141,6 +141,30 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
     return parser.parse_args(argv)
 
+def clean_text_column(df: DataFrame, input_col: str = "text", output_col: str = "text_clean") -> DataFrame:
+    c = F.col(input_col)
+
+    # 1) URLs
+    c = F.regexp_replace(c, r"(?i)\b(?:https?://|www\.)\S+\b", " ")
+
+    # 2) Artefacts HTML fréquents dans les tweets
+    c = F.regexp_replace(c, r"&amp;", " and ")
+    c = F.regexp_replace(c, r"&quot;", " ")
+    c = F.regexp_replace(c, r"&#39;", "'")
+    c = F.regexp_replace(c, r"&lt;|&gt;", " ")
+
+    # 3) Retweets & mentions
+    c = F.regexp_replace(c, r"(?i)^\s*rt\s+", " ")          # "RT " en début
+    c = F.regexp_replace(c, r"@[A-Za-z0-9_]+", " ")         # @user
+
+    # 4) Hashtags : on garde le mot sans le #
+    c = F.regexp_replace(c, r"#(\w+)", r"\1")
+
+    # 5) Espaces multiples + trim
+    c = F.regexp_replace(c, r"\s+", " ")
+    c = F.trim(c)
+
+    return df.withColumn(output_col, c)
 
 def configure_logging(level: str) -> None:
     logging.basicConfig(
