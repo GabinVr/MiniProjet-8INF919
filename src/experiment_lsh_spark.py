@@ -432,11 +432,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     pipeline = build_feature_pipeline(args.num_features, args.scenario)
     features_model = pipeline.fit(df)
-    has_tokens = F.udf(lambda v: v is not None and v.numNonzeros() > 0, BooleanType())
     features_df = (
         features_model.transform(df)
         .select("row_id", "label", "features")
-        .filter(has_tokens("features"))
     )
 
     train_df, test_df = features_df.randomSplit(
