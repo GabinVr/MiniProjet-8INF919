@@ -62,6 +62,8 @@ echo "-------------------------------------------------------------------"
 echo "On utilise l'environement virtuel Python"
 source "$SLURM_SUBMIT_DIR/.venv/bin/activate"
 echo "-------------------------------------------------------------------"
+export PYSPARK_PYTHON="$SLURM_SUBMIT_DIR/.venv/bin/python"
+export PYSPARK_DRIVER_PYTHON="$PYSPARK_PYTHON"
 
 cd "$SLURM_SUBMIT_DIR"
 
@@ -79,6 +81,8 @@ srun -n 1 -N 1 spark-submit \
   --driver-memory "${SLURM_SPARK_MEM}M" \
   --executor-memory "${SLURM_SPARK_MEM}M" \
   --conf spark.sql.shuffle.partitions=200 \
+  --conf spark.pyspark.python="${PYSPARK_PYTHON}" \
+  --conf spark.pyspark.driver.python="${PYSPARK_PYTHON}" \
   --conf spark.default.parallelism=100 \
   --conf spark.executor.cores="${SLURM_CPUS_PER_TASK}" \
   --conf spark.cores.max="$((NWORKERS * SLURM_CPUS_PER_TASK))" \
