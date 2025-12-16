@@ -11,11 +11,18 @@ from typing import Dict, List, Optional, Sequence
 import pandas as pd
 from pyspark import StorageLevel
 from pyspark.ml import Pipeline
-from pyspark.ml.feature import HashingTF, MinHashLSH, RegexTokenizer, StopWordsRemover
 from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
 from pyspark.sql.types import BooleanType, IntegerType, StringType, StructField, StructType
-
+from pyspark.ml.feature import (
+    HashingTF, 
+    MinHashLSH, 
+    RegexTokenizer, 
+    StopWordsRemover, 
+    NGram, 
+    CountVectorizer, 
+    VectorAssembler
+)
 LOGGER = logging.getLogger("spark_lsh")
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_PATH = REPO_ROOT / "data" / "training.1600000.processed.noemoticon.csv"
@@ -102,6 +109,20 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Verbosity level for logging.",
     )
+    parser.add_argument(
+        "--scenario",
+        type=int,
+        default=1,
+        choices=[1, 2, 3, 4],
+        help="1=Unigram, 2=Bigram, 3=Frequent Patterns, 4=Combined (1+2+3)",
+    )
+
+    parser.add_argument(
+        "--use-neutral",
+        action="store_true",
+        help="Include neutral tweets (label=2) in the dataset.",
+    )
+
     return parser.parse_args(argv)
 
 
@@ -123,7 +144,7 @@ def build_spark(app_name: str = "Sentiment140-MinHashSpark") -> SparkSession:
     )
 
 
-def load_dataset(spark: SparkSession, args: argparse.Namespace) -> DataFrame:
+def load_dataset(spark: SparkSession, args: argparse.Namespace, use_neutral: bool) -> DataFrame:
     if not args.data_path.exists():
         raise FileNotFoundError(f"Dataset not found at {args.data_path}")
 
@@ -146,14 +167,23 @@ def load_dataset(spark: SparkSession, args: argparse.Namespace) -> DataFrame:
 
     if args.max_rows and args.max_rows > 0:
         df = df.limit(args.max_rows)
-
-    df = df.withColumn(
-        "label",
-        F.when(F.col("label_raw") == 0, F.lit(0))
-        .when(F.col("label_raw") == 4, F.lit(1))
-        .otherwise(F.lit(None))
-        .cast(IntegerType()),
-    ).dropna(subset=["label"])
+    if use_neutral:
+        df = df.withColumn(
+            "label",
+            F.when(F.col("label_raw") == 0, F.lit(0))
+            .when(F.col("label_raw") == 2, F.lit(1))
+            .when(F.col("label_raw") == 4, F.lit(2))
+            .otherwise(F.lit(None)) 
+            .cast(IntegerType()),
+        ).dropna(subset=["label"])
+    else:
+        df = df.withColumn(
+            "label",
+            F.when(F.col("label_raw") == 0, F.lit(0))
+            .when(F.col("label_raw") == 4, F.lit(1))
+            .otherwise(F.lit(None))
+            .cast(IntegerType()),
+        ).dropna(subset=["label"])
 
     LOGGER.info("Spark DF loaded: %d rows", df.count())
     return df.select("label", "text")
@@ -174,25 +204,66 @@ def class_balanced_sample(df: DataFrame, per_class: int, seed: int) -> DataFrame
     return df.sampleBy("label", fractions=fractions, seed=seed)
 
 
-def build_feature_pipeline(num_features: int) -> Pipeline:
+def build_feature_pipeline(num_features: int, scenario: int) -> Pipeline:
     tokenizer = RegexTokenizer(
         inputCol="text",
         outputCol="tokens_raw",
         pattern=r"[^\w#@']+",
         toLowercase=True,
     )
+    
     remover = StopWordsRemover(
         inputCol="tokens_raw",
         outputCol="tokens",
         stopWords=sorted(set(StopWordsRemover.loadDefaultStopWords("english")) | DEFAULT_STOP_WORDS),
     )
-    hashing_tf = HashingTF(
-        inputCol="tokens",
-        outputCol="features",
-        numFeatures=num_features,
-        binary=True,
-    )
-    return Pipeline(stages=[tokenizer, remover, hashing_tf])
+
+    stages = [tokenizer, remover]
+
+    if scenario == 1:
+        hashing_tf = HashingTF(
+            inputCol="tokens",
+            outputCol="features",
+            numFeatures=num_features,
+            binary=True,
+        )
+        stages.append(hashing_tf)
+
+    elif scenario == 2:
+        ngram = NGram(n=2, inputCol="tokens", outputCol="bigrams")
+        hashing_tf = HashingTF(
+            inputCol="bigrams",
+            outputCol="features",
+            numFeatures=num_features,
+            binary=True,
+        )
+        stages.extend([ngram, hashing_tf])
+
+    elif scenario == 3:
+        cv = CountVectorizer(
+            inputCol="tokens",
+            outputCol="features",
+            vocabSize=1000,
+            binary=True
+        )
+        stages.append(cv)
+
+    elif scenario == 4:
+        htf_uni = HashingTF(inputCol="tokens", outputCol="vec_uni", numFeatures=num_features, binary=True)
+    
+        ngram = NGram(n=2, inputCol="tokens", outputCol="bigrams")
+        htf_bi = HashingTF(inputCol="bigrams", outputCol="vec_bi", numFeatures=num_features, binary=True)
+        
+        cv_pat = CountVectorizer(inputCol="tokens", outputCol="vec_pat", vocabSize=1000, binary=True)
+    
+        assembler = VectorAssembler(
+            inputCols=["vec_uni", "vec_bi", "vec_pat"],
+            outputCol="features"
+        )
+        
+        stages.extend([htf_uni, ngram, htf_bi, cv_pat, assembler])
+
+    return Pipeline(stages=stages)
 
 
 def evaluate_configuration(
@@ -318,12 +389,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     spark = build_spark()
     spark.sparkContext.setLogLevel("WARN")
 
-    df = load_dataset(spark, args)
+    df = load_dataset(spark, args, args.use_neutral)
     df = class_balanced_sample(df, args.samples_per_class, args.random_state)
     df = df.dropDuplicates(["text"])
     df = df.withColumn("row_id", F.monotonically_increasing_id())
 
-    pipeline = build_feature_pipeline(args.num_features)
+    pipeline = build_feature_pipeline(args.num_features, args.scenario)
     features_model = pipeline.fit(df)
     has_tokens = F.udf(lambda v: v is not None and v.numNonzeros() > 0, BooleanType())
     features_df = (
