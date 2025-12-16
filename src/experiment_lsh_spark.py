@@ -123,9 +123,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--scenario",
         type=int,
-        default=1,
-        choices=[1, 2, 3, 4],
-        help="1=Unigram, 2=Bigram, 3=Frequent Patterns, 4=Combined (1+2+3)",
+        default=0,
+        choices=[0, 1, 2, 3, 4],
+        help="0=All, 1=Unigram, 2=Bigram, 3=Frequent Patterns, 4=Combined (1+2+3)",
     )
 
     parser.add_argument(
@@ -367,29 +367,29 @@ class HFWPatternizerModel(
     DefaultParamsWritable,
 ):
     def __init__(
-    self,
-    inputCol: str = "tokens",
-    outputCol: str = "patterns",
-    topN: int = 300,
-    minN: int = 3,
-    maxN: int = 6,
-    minHFWInWindow: int = 2,
-    maxPatternsPerDoc: int = 80,
-):
+        self,
+        hfw_words: List[str],
+        inputCol: str = "tokens",
+        outputCol: str = "patterns",
+        minN: int = 3,
+        maxN: int = 6,
+        minHFWInWindow: int = 2,
+        maxPatternsPerDoc: int = 80,
+    ):
         super().__init__()
         self._set(inputCol=inputCol, outputCol=outputCol)
-        self.topN = topN
-        self.minN = minN
-        self.maxN = maxN
-        self.minHFWInWindow = minHFWInWindow
-        self.maxPatternsPerDoc = maxPatternsPerDoc
+        self.hfw_words = hfw_words  # required
+        self.minN = int(minN)
+        self.maxN = int(maxN)
+        self.minHFWInWindow = int(minHFWInWindow)
+        self.maxPatternsPerDoc = int(maxPatternsPerDoc)
 
     def _transform(self, dataset: DataFrame) -> DataFrame:
         hfw_set = set(self.hfw_words)
-        minN = self.minN
-        maxN = self.maxN
-        minHFW = self.minHFWInWindow
-        maxP = self.maxPatternsPerDoc
+        minN = int(self.minN)
+        maxN = int(self.maxN)
+        minHFW = int(self.minHFWInWindow)
+        maxP = int(self.maxPatternsPerDoc)
 
         def make_patterns(tokens):
             if not tokens:
@@ -646,12 +646,13 @@ def save_tables(df: pd.DataFrame, output_dir: Path) -> None:
     df.to_csv(csv_path, index=False)
 
     md_lines = [
-        "| numHashTables | k | accuracy | avg_candidates | train_time_s | eval_time_s |",
-        "| --- | --- | --- | --- | --- | --- |",
+        "| use_neutral | scenario | numHashTables | k | accuracy | avg_candidates | train_time_s | eval_time_s |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for row in df.itertuples(index=False):
         md_lines.append(
-            f"| {row.num_hash_tables} | {row.k} | {row.accuracy:.4f} | {row.avg_candidates:.1f} | "
+            f"| {int(getattr(row, 'use_neutral', 0))} | {int(getattr(row, 'scenario', -1))} | "
+            f"{row.num_hash_tables} | {row.k} | {row.accuracy:.4f} | {row.avg_candidates:.1f} | "
             f"{row.training_time_sec:.2f} | {row.evaluation_time_sec:.2f} |"
         )
     md_path.write_text("\n".join(md_lines), encoding="utf-8")
@@ -672,55 +673,84 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     df = df.dropDuplicates(["text_clean"])
     df = df.withColumn("row_id", F.monotonically_increasing_id())
 
-    pipeline = build_feature_pipeline(args.num_features, args.scenario)
-    features_model = pipeline.fit(df)
-    has_tokens = F.udf(lambda v: v is not None and v.numNonzeros() > 0, BooleanType())
-    features_df = (
-        features_model.transform(df)
-        .select("row_id", "label", "features")
-        # Filtre les vecteurs vides pour éviter l'erreur MinHash "Must have at least 1 non zero entry"
-        .filter(has_tokens("features"))
-    )
-
-    tmp = features_model.transform(df).select("text_clean", "tokens", "patterns").limit(5)
-    tmp.show(truncate=120)
-
-    train_df, test_df = features_df.randomSplit(
+    # Split BEFORE fitting the feature pipeline to avoid data leakage
+    train_raw, test_raw = df.randomSplit(
         [1 - args.test_fraction, args.test_fraction], seed=args.random_state
     )
-    train_df = train_df.cache()
-    test_df = test_df.cache()
-    train_size = train_df.count()
-    test_size = test_df.count()
-    LOGGER.info("Train size=%d | Test size=%d", train_size, test_size)
 
-    fallback_label = (
-        train_df.groupBy("label")
-        .count()
-        .orderBy(F.desc("count"))
-        .first()["label"]
-    )
+    scenarios = [args.scenario] if args.scenario in (1, 2, 3, 4) else [1, 2, 3, 4]
 
     results: List[Dict[str, float]] = []
-    for num_perm in args.num_hash_tables:
-        for k_neighbors in args.k_values:
-            res = evaluate_configuration(
-                train_df,
-                test_df,
-                train_size=train_size,
-                test_size=test_size,
-                num_perm=num_perm,
-                k_neighbors=k_neighbors,
-                similarity_threshold=args.similarity_threshold,
-                fallback_label=fallback_label,
-            )
-            results.append(res)
+
+    for scen in scenarios:
+        LOGGER.info("===== Running scenario %d =====", scen)
+
+        pipeline = build_feature_pipeline(args.num_features, scen)
+
+        # Fit the feature pipeline ONLY on the training split
+        features_model = pipeline.fit(train_raw)
+
+        has_tokens = F.udf(lambda v: v is not None and v.numNonzeros() > 0, BooleanType())
+
+        # Transform train/test separately with the model fitted on train
+        train_df = (
+            features_model.transform(train_raw)
+            .select("row_id", "label", "features")
+            # Filtre les vecteurs vides pour éviter l'erreur MinHash "Must have at least 1 non zero entry"
+            .filter(has_tokens("features"))
+            .cache()
+        )
+
+        test_df = (
+            features_model.transform(test_raw)
+            .select("row_id", "label", "features")
+            # Filtre les vecteurs vides pour éviter l'erreur MinHash "Must have at least 1 non zero entry"
+            .filter(has_tokens("features"))
+            .cache()
+        )
+
+        # Debug (safe): show patterns only when present
+        if scen in (3, 4):
+            features_model.transform(train_raw).select("text_clean", "tokens", "patterns").limit(5).show(truncate=120)
+        else:
+            features_model.transform(train_raw).select("text_clean", "tokens").limit(3).show(truncate=120)
+
+        train_size = train_df.count()
+        test_size = test_df.count()
+        LOGGER.info("Scenario %d | Train size=%d | Test size=%d", scen, train_size, test_size)
+
+        fallback_label = (
+            train_df.groupBy("label")
+            .count()
+            .orderBy(F.desc("count"))
+            .first()["label"]
+        )
+
+        for num_perm in args.num_hash_tables:
+            for k_neighbors in args.k_values:
+                res = evaluate_configuration(
+                    train_df,
+                    test_df,
+                    train_size=train_size,
+                    test_size=test_size,
+                    num_perm=num_perm,
+                    k_neighbors=k_neighbors,
+                    similarity_threshold=args.similarity_threshold,
+                    fallback_label=fallback_label,
+                )
+                # metadata for downstream tables/plots
+                res["scenario"] = int(scen)
+                res["use_neutral"] = int(bool(args.use_neutral))
+                results.append(res)
+
+        train_df.unpersist()
+        test_df.unpersist()
 
     spark.stop()
 
     ensure_output_dir(args.output_dir)
     df_results = pd.DataFrame(results)
-    df_results = df_results.sort_values(["num_hash_tables", "k"]).reset_index(drop=True)
+    df_results = df_results.sort_values(["use_neutral", "scenario", "num_hash_tables", "k"]).reset_index(drop=True)
     save_tables(df_results, args.output_dir)
 
     best = df_results.sort_values("accuracy", ascending=False).iloc[0]
