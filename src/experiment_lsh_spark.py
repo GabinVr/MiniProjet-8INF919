@@ -48,6 +48,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Path to the Sentiment140 CSV file.",
     )
     parser.add_argument(
+        "--test-path",
+        type=Path,
+        default=None,
+        help="Optional additional CSV (e.g., test.csv) to append before splitting.",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
     default=DEFAULT_OUTPUT_DIR,
@@ -125,6 +131,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Include neutral tweets (label=2) in the dataset.",
     )
 
+    parser.add_argument(
+        "--dataset-format",
+        type=str,
+        default="sentiment140",
+        choices=["sentiment140", "tweetextraction"],
+        help="Dataset schema: 'sentiment140' (6 cols, labels 0/4[/2]) or 'tweetextraction' (textID,text,selected_text,sentiment)",
+    )
+
     return parser.parse_args(argv)
 
 
@@ -145,50 +159,116 @@ def build_spark(app_name: str = "Sentiment140-MinHashSpark") -> SparkSession:
         .getOrCreate()
     )
 
+def clean_text_col(df: DataFrame) -> DataFrame:
+    """
+    Nettoie la colonne text de façon explicite avant la tokenisation:
+    - Mise en minuscules
+    - Suppression des URLs
+    - Suppression des mentions (@user)
+    - Normalisation des hashtags (garde le mot sans #)
+    - Suppression des caractères non alphabétiques de base (hors ' et _)
+    - Réduction des espaces multiples
+    """
+    txt = F.lower(F.col("text"))
+    # retire URLs
+    txt = F.regexp_replace(txt, r"https?://\S+", " ")
+    # retire mentions
+    txt = F.regexp_replace(txt, r"@[A-Za-z0-9_]+", " ")
+    # remplace #mot par mot
+    txt = F.regexp_replace(txt, r"#", " ")
+    # garde lettres/chiffres/_/' et espaces, remplace le reste par espace
+    txt = F.regexp_replace(txt, r"[^a-z0-9_'\s]", " ")
+    # espaces multiples -> simple
+    txt = F.regexp_replace(txt, r"\s+", " ")
+    # trim
+    txt = F.trim(txt)
+    return df.withColumn("text", txt)
 
 def load_dataset(spark: SparkSession, args: argparse.Namespace, use_neutral: bool) -> DataFrame:
-    if not args.data_path.exists():
-        raise FileNotFoundError(f"Dataset not found at {args.data_path}")
+    def load_sentiment140(path: Path) -> DataFrame:
+        if not path.exists():
+            raise FileNotFoundError(f"Dataset not found at {path}")
 
-    schema = StructType(
-        [
-            StructField("label_raw", IntegerType(), True),
-            StructField("tweet_id", StringType(), True),
-            StructField("date", StringType(), True),
-            StructField("query", StringType(), True),
-            StructField("user", StringType(), True),
-            StructField("text", StringType(), True),
-        ]
-    )
+        schema = StructType(
+            [
+                StructField("label_raw", IntegerType(), True),
+                StructField("tweet_id", StringType(), True),
+                StructField("date", StringType(), True),
+                StructField("query", StringType(), True),
+                StructField("user", StringType(), True),
+                StructField("text", StringType(), True),
+            ]
+        )
 
-    df = (
-        spark.read.csv(str(args.data_path), schema=schema, header=False, encoding="ISO-8859-1")
-        .select("label_raw", "text")
-        .dropna(subset=["text", "label_raw"])
-    )
+        df_local = (
+            spark.read.csv(str(path), schema=schema, header=False, encoding="ISO-8859-1")
+            .select("label_raw", "text")
+            .dropna(subset=["text", "label_raw"])
+        )
+        if args.max_rows and args.max_rows > 0:
+            df_local = df_local.limit(args.max_rows)
 
-    if args.max_rows and args.max_rows > 0:
-        df = df.limit(args.max_rows)
-    if use_neutral:
-        df = df.withColumn(
-            "label",
-            F.when(F.col("label_raw") == 0, F.lit(0))
-            .when(F.col("label_raw") == 2, F.lit(1))
-            .when(F.col("label_raw") == 4, F.lit(2))
-            .otherwise(F.lit(None)) 
-            .cast(IntegerType()),
-        ).dropna(subset=["label"])
-    else:
-        df = df.withColumn(
-            "label",
-            F.when(F.col("label_raw") == 0, F.lit(0))
-            .when(F.col("label_raw") == 4, F.lit(1))
-            .otherwise(F.lit(None))
-            .cast(IntegerType()),
-        ).dropna(subset=["label"])
+        if use_neutral:
+            df_local = df_local.withColumn(
+                "label",
+                F.when(F.col("label_raw") == 0, F.lit(0))
+                .when(F.col("label_raw") == 2, F.lit(1))
+                .when(F.col("label_raw") == 4, F.lit(2))
+                .otherwise(F.lit(None))
+                .cast(IntegerType()),
+            ).dropna(subset=["label"])
+        else:
+            df_local = df_local.withColumn(
+                "label",
+                F.when(F.col("label_raw") == 0, F.lit(0))
+                .when(F.col("label_raw") == 4, F.lit(1))
+                .otherwise(F.lit(None))
+                .cast(IntegerType()),
+            ).dropna(subset=["label"])
+
+        return df_local.select("label", "text")
+
+    def load_tweetextraction(path: Path) -> DataFrame:
+        if not path.exists():
+            raise FileNotFoundError(f"Dataset not found at {path}")
+
+        df_local = (
+            spark.read.csv(str(path), header=True, inferSchema=True)
+            .select(F.col("sentiment").alias("sentiment_str"), F.col("text"))
+            .dropna(subset=["text", "sentiment_str"])
+        )
+        if args.max_rows and args.max_rows > 0:
+            df_local = df_local.limit(args.max_rows)
+
+        if use_neutral:
+            df_local = df_local.withColumn(
+                "label",
+                F.when(F.lower(F.col("sentiment_str")) == "negative", F.lit(0))
+                .when(F.lower(F.col("sentiment_str")) == "neutral", F.lit(1))
+                .when(F.lower(F.col("sentiment_str")) == "positive", F.lit(2))
+                .otherwise(F.lit(None))
+                .cast(IntegerType()),
+            ).dropna(subset=["label"])
+        else:
+            df_local = df_local.withColumn(
+                "label",
+                F.when(F.lower(F.col("sentiment_str")) == "negative", F.lit(0))
+                .when(F.lower(F.col("sentiment_str")) == "positive", F.lit(1))
+                .otherwise(F.lit(None))
+                .cast(IntegerType()),
+            ).dropna(subset=["label"])
+
+        return df_local.select("label", "text")
+
+    loader = load_sentiment140 if args.dataset_format == "sentiment140" else load_tweetextraction
+
+    df = loader(args.data_path)
+    if args.test_path is not None:
+        df_extra = loader(args.test_path)
+        df = df.unionByName(df_extra)
 
     LOGGER.info("Spark DF loaded: %d rows", df.count())
-    return df.select("label", "text")
+    return df
 
 
 def class_balanced_sample(df: DataFrame, per_class: int, seed: int) -> DataFrame:
@@ -426,15 +506,20 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     spark.sparkContext.setLogLevel("WARN")
 
     df = load_dataset(spark, args, args.use_neutral)
+    # Nettoyage explicite du texte avant la tokenisation
+    df = clean_text_col(df)
     df = class_balanced_sample(df, args.samples_per_class, args.random_state)
     df = df.dropDuplicates(["text"])
     df = df.withColumn("row_id", F.monotonically_increasing_id())
 
     pipeline = build_feature_pipeline(args.num_features, args.scenario)
     features_model = pipeline.fit(df)
+    has_tokens = F.udf(lambda v: v is not None and v.numNonzeros() > 0, BooleanType())
     features_df = (
         features_model.transform(df)
         .select("row_id", "label", "features")
+        # Filtre les vecteurs vides pour éviter l'erreur MinHash "Must have at least 1 non zero entry"
+        .filter(has_tokens("features"))
     )
 
     train_df, test_df = features_df.randomSplit(

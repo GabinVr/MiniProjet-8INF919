@@ -57,12 +57,18 @@ echo "==========================================================================
 echo "EXÉCUTION MinHashLSH sur Sentiment140 (AVEC NEUTRE)"
 echo "==========================================================================="
 
+echo ""
+echo "-------------------------------------------------------------------"
+echo "On utilise l'environement virtuel Python"
+source "$SLURM_SUBMIT_DIR/.venv/bin/activate"
+echo "-------------------------------------------------------------------"
+
 cd "$SLURM_SUBMIT_DIR"
 
-SCRIPT_PY="$SLURM_SUBMIT_DIR/experiment_lsh_spark.py"
-# Assure-toi que ce fichier contient bien des données avec le label 2 (neutre)
-# Si tu utilises le training set standard (1.6M), il n'y a PAS de neutre dedans.
-DATA_PATH="$SLURM_SUBMIT_DIR/data/training.1600000.processed.noemoticon.csv"
+SCRIPT_PY="$SLURM_SUBMIT_DIR/src/experiment_lsh_spark.py"
+# Utilise le dataset Kaggle (avec neutre) situé dans src/data
+DATA_PATH="$SLURM_SUBMIT_DIR/src/data/train.csv"
+TEST_PATH="$SLURM_SUBMIT_DIR/src/data/test.csv"
 OUTPUT_DIR="$SLURM_SUBMIT_DIR/reports/lsh_spark_neutral"
 
 mkdir -p "$OUTPUT_DIR"
@@ -78,6 +84,8 @@ srun -n 1 -N 1 spark-submit \
   --conf spark.cores.max="$((NWORKERS * SLURM_CPUS_PER_TASK))" \
   "${SCRIPT_PY}" \
     --data-path "${DATA_PATH}" \
+    --test-path "${TEST_PATH}" \
+    --dataset-format tweetextraction \
     --output-dir "${OUTPUT_DIR}" \
     --samples-per-class 6000 \
     --test-fraction 0.2 \
@@ -88,7 +96,7 @@ srun -n 1 -N 1 spark-submit \
     --similarity-threshold 0.9 \
     --log-level INFO \
     --use-neutral \
-    --scenario 1
+    --scenario 3
 
 
 echo "==========================================================================="
