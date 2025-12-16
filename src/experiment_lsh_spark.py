@@ -144,23 +144,29 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 def clean_text_column(df: DataFrame, input_col: str = "text", output_col: str = "text_clean") -> DataFrame:
     c = F.col(input_col)
 
-    # 1) URLs
+    # Lowercase (explicite)
+    c = F.lower(c)
+
+    # URLs (http(s) + www)
     c = F.regexp_replace(c, r"(?i)\b(?:https?://|www\.)\S+\b", " ")
 
-    # 2) Artefacts HTML fréquents dans les tweets
+    # HTML entities fréquentes
     c = F.regexp_replace(c, r"&amp;", " and ")
-    c = F.regexp_replace(c, r"&quot;", " ")
+    c = F.regexp_replace(c, r"&quot;|&lt;|&gt;", " ")
     c = F.regexp_replace(c, r"&#39;", "'")
-    c = F.regexp_replace(c, r"&lt;|&gt;", " ")
 
-    # 3) Retweets & mentions
-    c = F.regexp_replace(c, r"(?i)^\s*rt\s+", " ")          # "RT " en début
-    c = F.regexp_replace(c, r"@[A-Za-z0-9_]+", " ")         # @user
+    # Retweets / mentions
+    c = F.regexp_replace(c, r"(?i)^\s*rt\s+", " ")
+    c = F.regexp_replace(c, r"@[A-Za-z0-9_]+", " ")
 
-    # 4) Hashtags : on garde le mot sans le #
+    # Hashtags: garder le mot sans '#'
     c = F.regexp_replace(c, r"#(\w+)", r"\1")
 
-    # 5) Espaces multiples + trim
+    # Remplacer la plupart des caractères non utiles par espace
+    # (on garde lettres/chiffres/_/apostrophe et espaces)
+    c = F.regexp_replace(c, r"[^a-z0-9_'\s]", " ")
+
+    # Espaces multiples + trim
     c = F.regexp_replace(c, r"\s+", " ")
     c = F.trim(c)
 
@@ -183,30 +189,6 @@ def build_spark(app_name: str = "Sentiment140-MinHashSpark") -> SparkSession:
         .getOrCreate()
     )
 
-def clean_text_col(df: DataFrame) -> DataFrame:
-    """
-    Nettoie la colonne text de façon explicite avant la tokenisation:
-    - Mise en minuscules
-    - Suppression des URLs
-    - Suppression des mentions (@user)
-    - Normalisation des hashtags (garde le mot sans #)
-    - Suppression des caractères non alphabétiques de base (hors ' et _)
-    - Réduction des espaces multiples
-    """
-    txt = F.lower(F.col("text"))
-    # retire URLs
-    txt = F.regexp_replace(txt, r"https?://\S+", " ")
-    # retire mentions
-    txt = F.regexp_replace(txt, r"@[A-Za-z0-9_]+", " ")
-    # remplace #mot par mot
-    txt = F.regexp_replace(txt, r"#", " ")
-    # garde lettres/chiffres/_/' et espaces, remplace le reste par espace
-    txt = F.regexp_replace(txt, r"[^a-z0-9_'\s]", " ")
-    # espaces multiples -> simple
-    txt = F.regexp_replace(txt, r"\s+", " ")
-    # trim
-    txt = F.trim(txt)
-    return df.withColumn("text", txt)
 
 def load_dataset(spark: SparkSession, args: argparse.Namespace, use_neutral: bool) -> DataFrame:
     def load_sentiment140(path: Path) -> DataFrame:
@@ -346,7 +328,7 @@ def bloom_filter_func(tokens, vector_size, num_hashes):
 
 def build_feature_pipeline(num_features: int, scenario: int) -> Pipeline:
     tokenizer = RegexTokenizer(
-        inputCol="text",
+        inputCol="text_clean",
         outputCol="tokens_raw",
         pattern=r"[^\w#@']+",
         toLowercase=True,
@@ -530,10 +512,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     spark.sparkContext.setLogLevel("WARN")
 
     df = load_dataset(spark, args, args.use_neutral)
-    # Nettoyage explicite du texte avant la tokenisation
-    df = clean_text_col(df)
+    df = clean_text_column(df, input_col="text", output_col="text_clean")
     df = class_balanced_sample(df, args.samples_per_class, args.random_state)
-    df = df.dropDuplicates(["text"])
+    df = df.dropDuplicates(["text_clean"])
     df = df.withColumn("row_id", F.monotonically_increasing_id())
 
     pipeline = build_feature_pipeline(args.num_features, args.scenario)
