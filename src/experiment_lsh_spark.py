@@ -115,8 +115,10 @@ def configure_logging(level: str) -> None:
 def build_spark(app_name: str = "Sentiment140-MinHashSpark") -> SparkSession:
     return (
         SparkSession.builder.appName(app_name)
-        .config("spark.sql.shuffle.partitions", "200")
+        .config("spark.sql.shuffle.partitions", "800")
+        .config("spark.sql.adaptive.enabled", "false")
         .config("spark.driver.maxResultSize", "4g")
+        .config("spark.sql.autoBroadcastJoinThreshold", "-1")
         .getOrCreate()
     )
 
@@ -215,12 +217,20 @@ def evaluate_configuration(
     pairs = joined.select(
         F.col("datasetA.row_id").alias("test_id"),
         F.col("datasetA.label").alias("test_label"),
+        F.col("datasetB.row_id").alias("train_id"),
         F.col("datasetB.label").alias("train_label"),
         F.col("distance"),
-    )
+    ).dropDuplicates(["test_id", "train_id"])
+
+    pairs = pairs.repartition("test_id")
 
     w = Window.partitionBy("test_id").orderBy("distance")
-    topk = pairs.withColumn("rank", F.row_number().over(w)).filter(F.col("rank") <= k_neighbors)
+    topk = (pairs
+            .withColumn("rank", F.row_number().over(w))
+            .filter(F.col("rank") <= k_neighbors)
+            .select("test_id", "test_label", "train_label")
+            .persist(StorageLevel.DISK_ONLY)
+    )
     topk = topk.persist(StorageLevel.MEMORY_AND_DISK)
 
     vote_counts = (
@@ -229,8 +239,7 @@ def evaluate_configuration(
         .withColumnRenamed("count", "votes")
     )
 
-    neighbor_rows = vote_counts.agg(F.sum("votes").alias("total_votes")).first()["total_votes"]
-    neighbor_rows = float(neighbor_rows or 0)
+    neighbor_rows = float(topk.count())
 
     vote_window = Window.partitionBy("test_id").orderBy(F.desc("votes"), F.asc("train_label"))
     predictions = (

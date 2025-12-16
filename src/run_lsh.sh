@@ -83,7 +83,7 @@ srun -n 1 -N 1 spark-submit \
     --num-hash-tables 128 250 \
     --k-values 50 100 150 200 \
     --num-features 32768 \
-    --similarity-threshold 1.0 \
+    --similarity-threshold 0.9 \
     --log-level INFO
 
 echo "==========================================================================="
