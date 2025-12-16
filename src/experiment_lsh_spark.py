@@ -7,13 +7,14 @@ import logging
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
-
+import zlib
 import pandas as pd
 from pyspark import StorageLevel
 from pyspark.ml import Pipeline
 from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
 from pyspark.sql.types import BooleanType, IntegerType, StringType, StructField, StructType
+from pyspark.ml.linalg import Vectors, VectorUDT
 from pyspark.ml.feature import (
     HashingTF, 
     MinHashLSH, 
@@ -119,6 +120,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
     parser.add_argument(
         "--use-neutral",
+        default=False,
         action="store_true",
         help="Include neutral tweets (label=2) in the dataset.",
     )
@@ -203,6 +205,40 @@ def class_balanced_sample(df: DataFrame, per_class: int, seed: int) -> DataFrame
     LOGGER.info("Sampling fractions per label: %s", fractions)
     return df.sampleBy("label", fractions=fractions, seed=seed)
 
+def bloom_filter_func(tokens, vector_size, num_hashes):
+    """
+    Transforme une liste de tokens en un vecteur binaire représentant un Filtre de Bloom.
+    
+    Principe :
+    Contrairement à HashingTF qui hache un mot vers 1 seul index, 
+    le filtre de Bloom hache un mot vers 'num_hashes' index différents.
+    Cela augmente la robustesse contre les collisions.
+    """
+    if not tokens:
+        return Vectors.sparse(vector_size, [], [])
+    
+    indices = set()
+    
+    for token in tokens:
+        # Conversion en bytes pour le hachage
+        b = token.encode('utf-8')
+        
+        # Nous utilisons deux fonctions de hachage de base : CRC32 et Adler32
+        # Ce sont des fonctions rapides et déterministes.
+        h1 = zlib.crc32(b)
+        h2 = zlib.adler32(b)
+        
+        # Astuce de Kirsch-Mitzenmacher :
+        # Au lieu de calculer k vrais hachages (lents), on simule k hachages
+        # avec la formule : g_i(x) = h1(x) + i * h2(x)
+        for i in range(num_hashes):
+            idx = (h1 + i * h2) % vector_size
+            indices.add(idx)
+            
+    # On retourne un SparseVector compatible avec PySpark ML
+    # Les valeurs sont toutes à 1.0 (présence binaire)
+    sorted_indices = sorted(list(indices))
+    return Vectors.sparse(vector_size, sorted_indices, [1.0] * len(sorted_indices))
 
 def build_feature_pipeline(num_features: int, scenario: int) -> Pipeline:
     tokenizer = RegexTokenizer(
@@ -396,11 +432,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     pipeline = build_feature_pipeline(args.num_features, args.scenario)
     features_model = pipeline.fit(df)
-    has_tokens = F.udf(lambda v: v is not None and v.numNonzeros() > 0, BooleanType())
     features_df = (
         features_model.transform(df)
         .select("row_id", "label", "features")
-        .filter(has_tokens("features"))
     )
 
     train_df, test_df = features_df.randomSplit(

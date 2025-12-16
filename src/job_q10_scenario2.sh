@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --account=def-sponsor00
-#SBATCH --time=02:00:00
+#SBATCH --time=00:40:00
 #SBATCH --nodes=4
 #SBATCH --mem=8G
 #SBATCH --cpus-per-task=8
@@ -59,7 +59,7 @@ echo "==========================================================================
 
 cd "$SLURM_SUBMIT_DIR"
 
-SCRIPT_PY="$SLURM_SUBMIT_DIR/src/experiment_lsh_spark.py"
+SCRIPT_PY="$SLURM_SUBMIT_DIR/experiment_lsh_spark.py"
 # Assure-toi que ce fichier contient bien des données avec le label 2 (neutre)
 # Si tu utilises le training set standard (1.6M), il n'y a PAS de neutre dedans.
 DATA_PATH="$SLURM_SUBMIT_DIR/data/training.1600000.processed.noemoticon.csv"
@@ -88,7 +88,7 @@ srun -n 1 -N 1 spark-submit \
     --similarity-threshold 0.9 \
     --log-level INFO \
     --use-neutral \
-    --scenario 4 
+    --scenario 2
 
 
 echo "==========================================================================="
