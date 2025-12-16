@@ -367,18 +367,18 @@ class HFWPatternizerModel(
     DefaultParamsWritable,
 ):
     def __init__(
-        self,
-        hfw_words: List[str],
-        inputCol: str,
-        outputCol: str,
-        minN: int,
-        maxN: int,
-        minHFWInWindow: int,
-        maxPatternsPerDoc: int,
-    ):
+    self,
+    inputCol: str = "tokens",
+    outputCol: str = "patterns",
+    topN: int = 300,
+    minN: int = 3,
+    maxN: int = 6,
+    minHFWInWindow: int = 2,
+    maxPatternsPerDoc: int = 80,
+):
         super().__init__()
-        self.hfw_words = hfw_words
         self._set(inputCol=inputCol, outputCol=outputCol)
+        self.topN = topN
         self.minN = minN
         self.maxN = maxN
         self.minHFWInWindow = minHFWInWindow
@@ -681,6 +681,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         # Filtre les vecteurs vides pour éviter l'erreur MinHash "Must have at least 1 non zero entry"
         .filter(has_tokens("features"))
     )
+
+    tmp = features_model.transform(df).select("text_clean", "tokens", "patterns").limit(5)
+    tmp.show(truncate=120)
 
     train_df, test_df = features_df.randomSplit(
         [1 - args.test_fraction, args.test_fraction], seed=args.random_state
