@@ -85,3 +85,6 @@ cython_debug/
 *.log
 
 training.1600000.processed.noemoticon.csv
+
+
+reports/*

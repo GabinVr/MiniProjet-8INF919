@@ -62,6 +62,8 @@ echo "-------------------------------------------------------------------"
 echo "On utilise l'environement virtuel Python"
 source "$SLURM_SUBMIT_DIR/.venv/bin/activate"
 echo "-------------------------------------------------------------------"
+export PYSPARK_PYTHON="$SLURM_SUBMIT_DIR/.venv/bin/python"
+export PYSPARK_DRIVER_PYTHON="$PYSPARK_PYTHON"
 
 cd "$SLURM_SUBMIT_DIR"
 
