@@ -15,6 +15,10 @@ from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
 from pyspark.sql.types import BooleanType, IntegerType, StringType, StructField, StructType
 from pyspark.ml.linalg import Vectors, VectorUDT
+from pyspark.ml import Estimator, Model
+from pyspark.ml.param.shared import HasInputCol, HasOutputCol
+from pyspark.ml.util import DefaultParamsReadable, DefaultParamsWritable
+from pyspark.sql.types import ArrayType
 from pyspark.ml.feature import (
     HashingTF, 
     MinHashLSH, 
@@ -291,6 +295,130 @@ def class_balanced_sample(df: DataFrame, per_class: int, seed: int) -> DataFrame
     LOGGER.info("Sampling fractions per label: %s", fractions)
     return df.sampleBy("label", fractions=fractions, seed=seed)
 
+class HFWPatternizer(
+    Estimator,
+    HasInputCol,
+    HasOutputCol,
+    DefaultParamsReadable,
+    DefaultParamsWritable,
+):
+    """
+    Estimator:
+    - fit(): calcule les High-Frequency Words (HFW) = topN tokens les plus fréquents
+    - retourne un Model qui transforme tokens -> patterns (HFW gardés, CW remplacés par '*')
+    """
+    def __init__(
+        self,
+        inputCol: str = "tokens",
+        outputCol: str = "patterns",
+        topN: int = 300,
+        minN: int = 3,
+        maxN: int = 6,
+        minHFWInWindow: int = 2,
+        maxPatternsPerDoc: int = 80,
+    ):
+        super().__init__()
+        self._setDefault(
+            inputCol=inputCol,
+            outputCol=outputCol,
+            topN=topN,
+            minN=minN,
+            maxN=maxN,
+            minHFWInWindow=minHFWInWindow,
+            maxPatternsPerDoc=maxPatternsPerDoc,
+        )
+        self._set(inputCol=inputCol, outputCol=outputCol)
+        self.topN = topN
+        self.minN = minN
+        self.maxN = maxN
+        self.minHFWInWindow = minHFWInWindow
+        self.maxPatternsPerDoc = maxPatternsPerDoc
+
+    def _fit(self, dataset: DataFrame):
+        topN = int(self.topN)
+        inputCol = self.getInputCol()
+
+        # fréquence des tokens
+        freq = (
+            dataset.select(F.explode(F.col(inputCol)).alias("tok"))
+            .groupBy("tok")
+            .count()
+            .orderBy(F.desc("count"))
+            .limit(topN)
+        )
+
+        hfw = [r["tok"] for r in freq.collect()]
+        return HFWPatternizerModel(
+            hfw_words=hfw,
+            inputCol=self.getInputCol(),
+            outputCol=self.getOutputCol(),
+            minN=int(self.minN),
+            maxN=int(self.maxN),
+            minHFWInWindow=int(self.minHFWInWindow),
+            maxPatternsPerDoc=int(self.maxPatternsPerDoc),
+        )
+
+
+class HFWPatternizerModel(
+    Model,
+    HasInputCol,
+    HasOutputCol,
+    DefaultParamsReadable,
+    DefaultParamsWritable,
+):
+    def __init__(
+        self,
+        hfw_words: List[str],
+        inputCol: str,
+        outputCol: str,
+        minN: int,
+        maxN: int,
+        minHFWInWindow: int,
+        maxPatternsPerDoc: int,
+    ):
+        super().__init__()
+        self.hfw_words = hfw_words
+        self._set(inputCol=inputCol, outputCol=outputCol)
+        self.minN = minN
+        self.maxN = maxN
+        self.minHFWInWindow = minHFWInWindow
+        self.maxPatternsPerDoc = maxPatternsPerDoc
+
+    def _transform(self, dataset: DataFrame) -> DataFrame:
+        hfw_set = set(self.hfw_words)
+        minN = self.minN
+        maxN = self.maxN
+        minHFW = self.minHFWInWindow
+        maxP = self.maxPatternsPerDoc
+
+        def make_patterns(tokens):
+            if not tokens:
+                return []
+            # stream HFW / *
+            stream = [t if t in hfw_set else "*" for t in tokens]
+            out = []
+            seen = set()
+
+            L = len(stream)
+            for n in range(minN, maxN + 1):
+                if n > L:
+                    break
+                for i in range(L - n + 1):
+                    win = stream[i : i + n]
+                    hfw_count = sum(1 for w in win if w != "*")
+                    if hfw_count < minHFW:
+                        continue
+                    p = "_".join(win)
+                    if p not in seen:
+                        seen.add(p)
+                        out.append(p)
+                        if len(out) >= maxP:
+                            return out
+            return out
+
+        udf_patterns = F.udf(make_patterns, ArrayType(StringType()))
+        return dataset.withColumn(self.getOutputCol(), udf_patterns(F.col(self.getInputCol())))
+    
 def bloom_filter_func(tokens, vector_size, num_hashes):
     """
     Transforme une liste de tokens en un vecteur binaire représentant un Filtre de Bloom.
@@ -362,28 +490,55 @@ def build_feature_pipeline(num_features: int, scenario: int) -> Pipeline:
         stages.extend([ngram, hashing_tf])
 
     elif scenario == 3:
-        cv = CountVectorizer(
+        # Patterns au sens "HFW + slots * + sous-séquences"
+        patternizer = HFWPatternizer(
             inputCol="tokens",
+            outputCol="patterns",
+            topN=300,        # ajuste si besoin
+            minN=3,
+            maxN=6,
+            minHFWInWindow=2,
+            maxPatternsPerDoc=80,
+        )
+        cv = CountVectorizer(
+            inputCol="patterns",
             outputCol="features",
-            vocabSize=1000,
+            vocabSize=20000,
             binary=True
         )
-        stages.append(cv)
+        stages.extend([patternizer, cv])
 
     elif scenario == 4:
+        # Unigram
         htf_uni = HashingTF(inputCol="tokens", outputCol="vec_uni", numFeatures=num_features, binary=True)
-    
+
+        # Bigram
         ngram = NGram(n=2, inputCol="tokens", outputCol="bigrams")
         htf_bi = HashingTF(inputCol="bigrams", outputCol="vec_bi", numFeatures=num_features, binary=True)
-        
-        cv_pat = CountVectorizer(inputCol="tokens", outputCol="vec_pat", vocabSize=1000, binary=True)
-    
+
+        # Patterns
+        patternizer = HFWPatternizer(
+            inputCol="tokens",
+            outputCol="patterns",
+            topN=300,
+            minN=3,
+            maxN=6,
+            minHFWInWindow=2,
+            maxPatternsPerDoc=80,
+        )
+        cv_pat = CountVectorizer(
+            inputCol="patterns",
+            outputCol="vec_pat",
+            vocabSize=20000,
+            binary=True
+        )
+
         assembler = VectorAssembler(
             inputCols=["vec_uni", "vec_bi", "vec_pat"],
             outputCol="features"
         )
-        
-        stages.extend([htf_uni, ngram, htf_bi, cv_pat, assembler])
+
+        stages.extend([htf_uni, ngram, htf_bi, patternizer, cv_pat, assembler])
 
     return Pipeline(stages=stages)
 
