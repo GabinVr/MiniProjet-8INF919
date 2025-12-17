@@ -2,7 +2,7 @@
 #SBATCH --account=def-sponsor00
 #SBATCH --time=00:40:00
 #SBATCH --nodes=4
-#SBATCH --mem=8G
+#SBATCH --mem=12G
 #SBATCH --cpus-per-task=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --output=logs/%x_%j.out
@@ -80,8 +80,10 @@ srun -n 1 -N 1 spark-submit \
   --deploy-mode client \
   --driver-memory "${SLURM_SPARK_MEM}M" \
   --executor-memory "${SLURM_SPARK_MEM}M" \
-  --conf spark.sql.shuffle.partitions=200 \
-  --conf spark.default.parallelism=100 \
+  --conf spark.sql.shuffle.partitions=400 \
+  --conf spark.pyspark.python="${PYSPARK_PYTHON}" \
+  --conf spark.pyspark.driver.python="${PYSPARK_PYTHON}" \
+  --conf spark.default.parallelism=200 \
   --conf spark.executor.cores="${SLURM_CPUS_PER_TASK}" \
   --conf spark.cores.max="$((NWORKERS * SLURM_CPUS_PER_TASK))" \
   "${SCRIPT_PY}" \
