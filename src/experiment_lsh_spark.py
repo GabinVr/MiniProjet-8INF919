@@ -120,8 +120,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--scenario",
         type=int,
         default=1,
-        choices=[1, 2, 3, 4],
-        help="1=Unigram, 2=Bigram, 3=Frequent Patterns, 4=Combined (1+2+3)",
+        choices=[1, 2, 3, 4, 5],
+        help="1=Unigram, 2=Bigram, 3=Frequent Patterns, 4=Combined (1+2+3), 5=Bloom Filter",
     )
 
     parser.add_argument(
@@ -137,6 +137,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default="sentiment140",
         choices=["sentiment140", "tweetextraction"],
         help="Dataset schema: 'sentiment140' (6 cols, labels 0/4[/2]) or 'tweetextraction' (textID,text,selected_text,sentiment)",
+    )
+
+    parser.add_argument(
+        "--bloom-num-hashes",
+        type=int,
+        default=4,
+        help="Number of hash functions to use in the Bloom filter (if implemented).",
     )
 
     return parser.parse_args(argv)
@@ -378,6 +385,9 @@ def build_feature_pipeline(num_features: int, scenario: int) -> Pipeline:
         )
         
         stages.extend([htf_uni, ngram, htf_bi, cv_pat, assembler])
+    
+    elif scenario == 5:
+        stages = [tokenizer, remover]
 
     return Pipeline(stages=stages)
 
@@ -515,12 +525,27 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     pipeline = build_feature_pipeline(args.num_features, args.scenario)
     features_model = pipeline.fit(df)
     has_tokens = F.udf(lambda v: v is not None and v.numNonzeros() > 0, BooleanType())
-    features_df = (
-        features_model.transform(df)
-        .select("row_id", "label", "features")
-        # Filtre les vecteurs vides pour éviter l'erreur MinHash "Must have at least 1 non zero entry"
-        .filter(has_tokens("features"))
-    )
+    # Rétrocompatibilité: pour les scénarios 1-4 on garde HashingTF/CountVectorizer/Assembler
+    # Pour le scénario 5 (Bloom), on fabrique 'features' via une UDF après la tokenisation
+    if args.scenario == 5:
+        bloom_udf = F.udf(
+            lambda toks: bloom_filter_func(toks, args.num_features, args.bloom_num_hashes),
+            VectorUDT(),
+        )
+        transformed = features_model.transform(df).select("row_id", "label", "tokens")
+        features_df = (
+            transformed
+            .withColumn("features", bloom_udf(F.col("tokens")))
+            .select("row_id", "label", "features")
+            .filter(has_tokens("features"))
+        )
+    else:
+        features_df = (
+            features_model.transform(df)
+            .select("row_id", "label", "features")
+            # Filtre les vecteurs vides pour éviter l'erreur MinHash "Must have at least 1 non zero entry"
+            .filter(has_tokens("features"))
+        )
 
     train_df, test_df = features_df.randomSplit(
         [1 - args.test_fraction, args.test_fraction], seed=args.random_state
